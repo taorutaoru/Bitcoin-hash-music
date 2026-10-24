@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Block Melody — Bitcoin Lo-Fi</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#111318; color:#f1eee8; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:22px 18px 36px; }
+  h1 { font-size:27px; margin:8px 0 4px; letter-spacing:.02em; }
+  .sub { color:#a9a8b0; line-height:1.5; margin:0 0 22px; }
+  .card { background:#1c1f27; border:1px solid #343743; border-radius:16px; padding:16px; margin:12px 0; }
+  .label { color:#a9a8b0; font-size:12px; text-transform:uppercase; letter-spacing:.09em; }
+  .value { font-size:20px; font-weight:650; margin-top:7px; overflow-wrap:anywhere; }
+  .hash { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:14px; line-height:1.6; color:#d9d6cc; }
+  .buttons { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:14px 0; }
+  button { border:0; border-radius:12px; padding:14px 10px; font-size:16px; font-weight:700; color:#111318; background:#e8c88b; }
+  button.secondary { background:#3a3e4b; color:#f1eee8; }
+  button:disabled { opacity:.45; }
+  .status { font-size:14px; line-height:1.55; color:#d7d3c9; }
+  .meter { display:flex; gap:5px; align-items:end; height:66px; margin-top:12px; }
+  .bar { flex:1; min-width:3px; background:#d8b878; border-radius:4px 4px 0 0; height:8px; transition:height .12s; }
+  .note { display:inline-block; border:1px solid #494d5a; border-radius:7px; padding:5px 8px; margin:4px 3px 0 0; font-size:13px; }
+  .small { color:#a9a8b0; font-size:12px; line-height:1.55; }
+  a { color:#e8c88b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Block Melody</h1>
+  <p class="sub">Bitcoinのブロックハッシュから音程を作る、Lo-Fi音楽の試作版。</p>
+
+  <div class="buttons">
+    <button id="start">▶ 再生・自動取得開始</button>
+    <button id="stop" class="secondary" disabled>■ 停止</button>
+  </div>
+
+  <section class="card">
+    <div class="label">状態</div>
+    <div id="status" class="status">「再生・自動取得開始」を押してください。音を出すには最初のタップが必要です。</div>
+  </section>
+
+  <section class="card">
+    <div class="label">最新ブロック高</div>
+    <div id="height" class="value">—</div>
+    <div class="label" style="margin-top:18px">ブロックハッシュ</div>
+    <div id="hash" class="value hash">未取得</div>
+    <div class="label" style="margin-top:18px">末尾20桁</div>
+    <div id="tail" class="value hash">—</div>
+  </section>
+
+  <section class="card">
+    <div class="label">生成されたメロディ</div>
+    <div id="notes"><span class="small">ブロック取得後に表示されます。</span></div>
+    <div id="meter" class="meter" aria-label="音量表示"></div>
+  </section>
+
+  <section class="card">
+    <div class="label">動作について</div>
+    <p class="small">10秒ごとに最新ブロック高を確認し、高さが変わったときだけハッシュを取得してメロディを更新します。音はブラウザ内で生成します。Safariの画面を開いたまま使用してください。</p>
+    <p class="small">API：<a href="https://mempool.space/docs/api/rest" target="_blank" rel="noopener">mempool.space REST API</a></p>
+  </section>
+  <p class="small">試作版です。ブラウザやネットワークの制限でAPI接続が失敗する場合は、HTTPSで公開したページから開く必要があります。</p>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const startBtn = $('start'), stopBtn = $('stop');
+  let audioCtx = null, running = false, timer = null, lastHeight = null, melodyTimer = null;
+  let melody = [], noteIndex = 0, master = null, beatTimer = null, beatIndex = 0;
+  const SCALE = [0, 2, 3, 5, 7, 10]; // Dorian風の落ち着いた6音音階
+  const BASE = 48; // C3 MIDI
+  const bars = [];
+
+  for (let i=0; i<20; i++) {
+    const b = document.createElement('div');
+    b.className = 'bar';
+    $('meter').appendChild(b);
+    bars.push(b);
+  }
+
+  function midiHz(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+  async function initAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      master = audioCtx.createGain();
+      master.gain.value = 0.55;
+      master.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+  }
+
+  function tone(freq, duration, volume, type='triangle', when=null) {
+    if (!audioCtx || !master) return;
+    const t = when ?? audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const filter = audioCtx.createBiquadFilter();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(type === 'sine' ? 900 : 1700, t);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.001, volume), t + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+    osc.connect(filter); filter.connect(gain); gain.connect(master);
+    osc.start(t); osc.stop(t + duration + 0.03);
+  }
+
+  function kick(t) {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(105, t);
+    o.frequency.exponentialRampToValueAtTime(48, t + 0.12);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.34, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t + 0.22);
+  }
+
+  function hat(t, vol=0.035) {
+    if (!audioCtx) return;
+    const n = Math.floor(audioCtx.sampleRate * 0.055);
+    const buffer = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0; i<n; i++) data[i] = (Math.random()*2-1) * (1-i/n);
+    const src = audioCtx.createBufferSource(), filter = audioCtx.createBiquadFilter(), g = audioCtx.createGain();
+    filter.type = 'highpass'; filter.frequency.value = 6500;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t+0.045);
+    src.buffer = buffer; src.connect(filter); filter.connect(g); g.connect(master); src.start(t);
+  }
+
+  function snare(t) {
+    if (!audioCtx) return;
+    const n = Math.floor(audioCtx.sampleRate * 0.12);
+    const buffer = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0; i<n; i++) data[i] = (Math.random()*2-1) * Math.pow(1-i/n, 2);
+    const src = audioCtx.createBufferSource(), filter = audioCtx.createBiquadFilter(), g = audioCtx.createGain();
+    filter.type = 'bandpass'; filter.frequency.value = 1800; filter.Q.value = 0.7;
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.11,t+0.005); g.gain.exponentialRampToValueAtTime(0.0001,t+0.12);
+    src.buffer=buffer; src.connect(filter); filter.connect(g); g.connect(master); src.start(t);
+    tone(midiHz(47), 0.08, 0.045, 'sine', t);
+  }
+
+  function playBeat() {
+    if (!running || !audioCtx) return;
+    const t = audioCtx.currentTime + 0.025;
+    const step = beatIndex % 16;
+    if (step === 0 || step === 8) kick(t);
+    if (step === 4 || step === 12) snare(t);
+    hat(t, (step % 4 === 2) ? 0.025 : 0.038);
+    // Melody every other eighth-note; melody changes only on a new block.
+    if (step % 2 === 0 && melody.length) {
+      const m = melody[noteIndex % melody.length];
+      if (m !== null) {
+        tone(midiHz(m), 0.28, 0.105, 'triangle', t);
+        bars[noteIndex % bars.length].style.height = (12 + ((m % 24) * 2)) + 'px';
+        noteIndex++;
+      }
+    }
+    beatIndex++;
+  }
+
+  function makeMelody(tail) {
+    const digits = tail.toLowerCase().split('').map(c => parseInt(c,16));
+    const out = [];
+    for (let i=0; i<digits.length; i+=2) {
+      const pair = digits[i]*16 + digits[i+1];
+      const scaleIndex = pair % SCALE.length;
+      const octave = Math.floor((pair / SCALE.length) % 3); // 0–2
+      out.push(BASE + SCALE[scaleIndex] + octave*12);
+    }
+    return out;
+  }
+
+  function showMelody() {
+    $('notes').innerHTML = '';
+    melody.forEach((m,i) => {
+      const s = document.createElement('span');
+      s.className = 'note';
+      s.textContent = midiName(m);
+      $('notes').appendChild(s);
+    });
+  }
+  function midiName(m) {
+    const names = ['C','C♯','D','D♯','E','F','F♯','G','G♯','A','A♯','B'];
+    return names[m%12] + (Math.floor(m/12)-1);
+  }
+
+  async function fetchText(url) {
+    const r = await fetch(url, {cache:'no-store'});
+    if (!r.ok) throw new Error('API応答 ' + r.status);
+    return (await r.text()).trim();
+  }
+
+  async function pollBlock() {
+    if (!running) return;
+    try {
+      const heightText = await fetchText('https://mempool.space/api/blocks/tip/height');
+      const height = Number(heightText);
+      if (!Number.isFinite(height)) throw new Error('ブロック高を読み取れません');
+      if (lastHeight === null || height !== lastHeight) {
+        const hash = await fetchText('https://mempool.space/api/block-height/' + height);
+        if (!/^[0-9a-f]{64}$/i.test(hash)) throw new Error('ハッシュ形式が想定と異なります');
+        const tail = hash.slice(-20);
+        lastHeight = height;
+        $('height').textContent = height.toLocaleString('en-US');
+        $('hash').textContent = hash;
+        $('tail').textContent = tail;
+        melody = makeMelody(tail);
+        noteIndex = 0;
+        showMelody();
+        $('status').textContent = '取得成功：ブロック ' + height + '。ハッシュ末尾20桁からメロディを生成しました。';
+      } else {
+        $('status').textContent = '監視中：ブロック ' + height + '。新しいブロックを待っています。';
+      }
+    } catch (e) {
+      $('status').textContent = '取得できませんでした：' + e.message + '。ネット接続を確認してください。ローカルHTMLでは接続制限が出る場合があります。';
+    }
+  }
+
+  async function start() {
+    if (running) return;
+    try {
+      await initAudio();
+      running = true;
+      startBtn.disabled = true; stopBtn.disabled = false;
+      beatIndex = 0;
+      await pollBlock();
+      timer = setInterval(pollBlock, 10000);
+      beatTimer = setInterval(playBeat, (60000 / 82) / 2);
+      $('status').textContent += ' テンポ82 BPMで再生中です。';
+    } catch(e) {
+      $('status').textContent = '音声を開始できませんでした：' + e.message;
+    }
+  }
+
+  function stop() {
+    running = false;
+    clearInterval(timer); clearInterval(beatTimer);
+    timer = beatTimer = null;
+    startBtn.disabled = false; stopBtn.disabled = true;
+    $('status').textContent = '停止しました。再生ボタンで再開できます。';
+    bars.forEach(b => b.style.height='8px');
+  }
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+})();
+</script>
+</body>
+</html>
